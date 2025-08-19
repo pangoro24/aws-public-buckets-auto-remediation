@@ -1,0 +1,343 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >
+  AWS Config con regla personalizada respaldada por Lambda + remediación automática con SSM Automation 
+  para asegurar que todos los buckets S3 tengan bloqueado el acceso público.
+
+Resources:
+  # CloudWatch Log Group for Lambda
+  EvaluationFunctionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/poc-evaluation-function-s3-block-public-access"
+      RetentionInDays: 14
+
+  EvaluationFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: EvaluationFunctionLogGroup
+    Properties:
+      FunctionName: poc-evaluation-function-s3-block-public-access
+      Handler: index.lambda_handler
+      Runtime: python3.12
+      Timeout: 60
+      MemorySize: 256
+      Role: !GetAtt EvaluationFunctionExecutionRole.Arn
+      Environment:
+        Variables:
+          LOG_LEVEL: INFO
+      Code:
+        ZipFile: |
+          import boto3
+          import botocore
+          import json
+          import logging
+          import os
+          from datetime import datetime, timezone
+
+          # Configure logging for CloudWatch
+          logging.basicConfig(
+              level=logging.INFO,
+              format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+          )
+          logger = logging.getLogger(__name__)
+          
+          # Set log level from environment variable
+          log_level = os.environ.get('LOG_LEVEL', 'INFO')
+          logger.setLevel(getattr(logging, log_level))
+
+          def put_evaluations_batch(config_client, evaluations, result_token):
+              """Process evaluations in batches of 100 and report to AWS Config"""
+              batch_size = 100
+              for i in range(0, len(evaluations), batch_size):
+                  batch = evaluations[i:i + batch_size]
+                  try:
+                      config_client.put_evaluations(
+                          Evaluations=batch,
+                          ResultToken=result_token
+                      )
+                      logger.info(f"Successfully reported batch of {len(batch)} evaluations")
+                  except Exception as e:
+                      logger.error(f"Error reporting evaluations: {str(e)}")
+
+          def is_public_access_fully_blocked(public_access_config):
+              """Check if all public access block settings are enabled"""
+              required_settings = {
+                  'BlockPublicAcls': True,
+                  'IgnorePublicAcls': True,
+                  'BlockPublicPolicy': True,
+                  'RestrictPublicBuckets': True
+              }
+              
+              for setting, required_value in required_settings.items():
+                  if public_access_config.get(setting) != required_value:
+                      logger.info(f"Setting {setting} is not properly configured: {public_access_config.get(setting)}")
+                      return False
+              
+              return True
+
+          def lambda_handler(event, context):
+              logger.info("=== LAMBDA EXECUTION STARTED ===")
+              logger.info(f"Function name: {context.function_name}")
+              logger.info(f"Request ID: {context.aws_request_id}")
+              logger.info(f"Received event: {json.dumps(event, default=str)}")
+              
+              if "invokingEvent" not in event or "resultToken" not in event:
+                  error_msg = "Missing 'invokingEvent' or 'resultToken' in event data."
+                  logger.error(error_msg)
+                  logger.error(f"Event keys present: {list(event.keys())}")
+                  return {
+                      "compliance_type": "ERROR",
+                      "annotation": error_msg
+                  }
+                  
+              try:
+                  invoking_event = json.loads(event["invokingEvent"])
+              except json.JSONDecodeError as e:
+                  logger.error(f"Failed to parse 'invokingEvent': {e}")
+                  return {
+                      "compliance_type": "ERROR",
+                      "annotation": "Failed to parse 'invokingEvent' JSON."
+                  }
+                  
+              result_token = event["resultToken"]
+              
+              s3 = boto3.client("s3")
+              config = boto3.client('config')
+              evaluations = []
+              
+              try:
+                  all_buckets = s3.list_buckets()
+                  bucket_count = len(all_buckets.get("Buckets", []))
+                  logger.info(f"Found {bucket_count} buckets to evaluate")
+                  
+                  if bucket_count == 0:
+                      logger.info("No S3 buckets found in the account")
+                      return {
+                          "compliance_type": "NOT_APPLICABLE",
+                          "annotation": "No S3 buckets found in the account."
+                      }
+                  
+                  for bucket in all_buckets['Buckets']:
+                      bucket_name = bucket['Name']
+                      logger.info(f"Evaluating bucket: {bucket_name}")
+                      
+                      evaluation = {
+                          'ComplianceResourceType': 'AWS::S3::Bucket',
+                          'ComplianceResourceId': bucket_name,
+                          'OrderingTimestamp': datetime.now(timezone.utc).isoformat()
+                      }
+                      
+                      try:
+                          # Get public access block configuration
+                          response = s3.get_public_access_block(Bucket=bucket_name)
+                          public_access_config = response.get('PublicAccessBlockConfiguration', {})
+                          
+                          # Check if all public access block settings are properly configured
+                          if is_public_access_fully_blocked(public_access_config):
+                              evaluation['ComplianceType'] = 'COMPLIANT'
+                              evaluation['Annotation'] = 'All public access block settings are properly enabled.'
+                              logger.info(f"Bucket {bucket_name}: COMPLIANT - All public access settings enabled")
+                          else:
+                              evaluation['ComplianceType'] = 'NON_COMPLIANT'
+                              evaluation['Annotation'] = f'Public access block not fully configured. Current settings: {public_access_config}'
+                              logger.warning(f"Bucket {bucket_name}: NON_COMPLIANT - Incomplete public access block configuration")
+                          
+                      except botocore.exceptions.ClientError as e:
+                          error_code = e.response['Error']['Code']
+                          
+                          if error_code == 'NoSuchPublicAccessBlockConfiguration':
+                              # If the block doesn't exist, it's NON_COMPLIANT
+                              evaluation['ComplianceType'] = 'NON_COMPLIANT'
+                              evaluation['Annotation'] = 'No public access block configuration found.'
+                              logger.warning(f"Bucket {bucket_name}: NON_COMPLIANT - No public access block configuration")
+                          else:
+                              # Other ClientErrors are considered non-compliant
+                              evaluation['ComplianceType'] = 'NON_COMPLIANT'
+                              evaluation['Annotation'] = f'Error checking public access block: {error_code}'
+                              logger.error(f"Bucket {bucket_name}: ERROR - {error_code}")
+                          
+                      except Exception as e:
+                          # Catch any unexpected errors during evaluation
+                          logger.error(f"Unexpected error evaluating bucket {bucket_name}: {str(e)}")
+                          evaluation['ComplianceType'] = 'NON_COMPLIANT'
+                          evaluation['Annotation'] = f'Unexpected error occurred: {str(e)}'
+                      
+                      evaluations.append(evaluation)
+                      
+                  # Report evaluations to AWS Config
+                  if evaluations:
+                      logger.info(f"Reporting {len(evaluations)} evaluations to AWS Config")
+                      put_evaluations_batch(config, evaluations, result_token)
+                      
+                      # Log summary of results
+                      compliant_count = sum(1 for e in evaluations if e.get('ComplianceType') == 'COMPLIANT')
+                      non_compliant_count = len(evaluations) - compliant_count
+                      logger.info(f"Results summary - Compliant: {compliant_count}, Non-compliant: {non_compliant_count}")
+                      logger.info(f"Successfully completed evaluation of {len(evaluations)} buckets")
+                      
+                      logger.info("=== LAMBDA EXECUTION COMPLETED SUCCESSFULLY ===")
+                      return {
+                          "statusCode": 200,
+                          "body": f"Successfully evaluated {len(evaluations)} buckets."
+                      }
+                  else:
+                      logger.warning("No evaluations to report")
+                      logger.info("=== LAMBDA EXECUTION COMPLETED ===")
+                      return {
+                          "statusCode": 200,
+                          "body": "No buckets found to evaluate."
+                      }
+                  
+              except botocore.exceptions.ClientError as e:
+                  error_message = f"S3 Client Error: {e.response['Error']['Code']} - {e.response['Error']['Message']}"
+                  logger.error(error_message)
+                  return {
+                      "compliance_type": "ERROR",
+                      "annotation": error_message
+                  }
+              except Exception as e:
+                  error_message = f"Unexpected error: {str(e)}"
+                  logger.error(error_message)
+                  return {
+                      "compliance_type": "ERROR",
+                      "annotation": error_message
+                  }
+
+  EvaluationFunctionExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: S3ConfigEvaluationFunctionExecutionRole
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: AllowS3Access
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: 
+                  - s3:ListAllMyBuckets
+                  - s3:GetBucketPublicAccessBlock
+                Resource: "arn:aws:s3:::*"
+              - Effect: Allow
+                Action: 
+                  - config:PutEvaluations
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                  - logs:DescribeLogStreams
+                  - logs:DescribeLogGroups
+                Resource: 
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/poc-evaluation-function-s3-block-public-access"
+                  - !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/poc-evaluation-function-s3-block-public-access:*"
+
+  EvaluationLambdaInvokePermissions:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      FunctionName: !GetAtt EvaluationFunction.Arn
+      Action: lambda:InvokeFunction
+      Principal: config.amazonaws.com
+
+  EvaluationRule:
+    Type: AWS::Config::ConfigRule
+    Properties:
+      ConfigRuleName: poc-rule-bkct-block-public-access
+      Description: Evalúa si los buckets S3 tienen correctamente bloqueado el acceso público.
+      Scope:
+        ComplianceResourceTypes:
+          - "AWS::S3::Bucket"
+      Source:
+        Owner: CUSTOM_LAMBDA
+        SourceIdentifier: !GetAtt EvaluationFunction.Arn
+        SourceDetails:
+          - EventSource: aws.config
+            MessageType: ScheduledNotification
+            MaximumExecutionFrequency: TwentyFour_Hours
+
+  RemediationExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: RemediationExecutionRole-CustomS3Block
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ssm.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: AllowS3Remediation
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: s3:PutBucketPublicAccessBlock
+                Resource: "arn:aws:s3:::*"
+
+  RemediationDocument:
+    Type: AWS::SSM::Document
+    Properties:
+      DocumentType: Automation
+      Name: BlockS3PublicAccessAutomation
+      Content:
+        schemaVersion: '0.3'
+        description: "Bloquea acceso público en un bucket S3 usando PutPublicAccessBlock"
+        assumeRole: "{{ AutomationAssumeRole }}"
+        parameters:
+          BucketName:
+            type: String
+          AutomationAssumeRole:
+            type: String
+        mainSteps:
+          - name: BlockBucketPublicAccess
+            action: aws:executeAwsApi
+            inputs:
+              Service: s3
+              Api: PutPublicAccessBlock
+              Bucket: "{{ BucketName }}"
+              PublicAccessBlockConfiguration:
+                BlockPublicAcls: true
+                IgnorePublicAcls: true
+                BlockPublicPolicy: true
+                RestrictPublicBuckets: true
+
+  ConfigRemediation:
+    Type: AWS::Config::RemediationConfiguration
+    Properties:
+      ConfigRuleName: !Ref EvaluationRule
+      TargetType: SSM_DOCUMENT
+      TargetId: !Ref RemediationDocument
+      Automatic: true
+      MaximumAutomaticAttempts: 1
+      RetryAttemptSeconds: 60
+      Parameters:
+        BucketName:
+          ResourceValue:
+            Value: RESOURCE_ID
+        AutomationAssumeRole:
+          StaticValue:
+            Values:
+              - !GetAtt RemediationExecutionRole.Arn
+
+Outputs:
+  LambdaFunctionName:
+    Description: "Nombre de la función Lambda de evaluación"
+    Value: !Ref EvaluationFunction
+    Export:
+      Name: !Sub "${AWS::StackName}-LambdaFunction"
+        
+  ConfigRuleName:
+    Description: "Nombre de la regla de AWS Config"
+    Value: !Ref EvaluationRule
+    Export:
+      Name: !Sub "${AWS::StackName}-ConfigRule"
+      
